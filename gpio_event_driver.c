@@ -4,8 +4,12 @@
 #include <linux/device.h>
 #include <linux/uaccess.h>
 #include <linux/err.h>
+#include <linux/gpio.h>
 
 #define DEV_NAME "gpio_event"
+#define GPIO_BASE 512
+#define LED_GPIO_BCM 17
+#define LED_GPIO (GPIO_BASE + LED_GPIO_BCM)
 
 static dev_t gpio_event_devt;
 static struct cdev gpio_event_cdev;
@@ -30,16 +34,21 @@ static ssize_t gpio_event_read(struct file *file, char __user *buf, size_t count
 
 static ssize_t gpio_event_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 {
-    if (*ppos >= sizeof(data))
-        return -ENOSPC;
+    char data;
 
-    if (count > sizeof(data) - *ppos)
-        count = sizeof(data) - *ppos;
+    if (count < 1)
+        return -EINVAL;
 
-    if (copy_from_user(data + *ppos, buf, count))
+    if (copy_from_user(&data, buf, 1))
         return -EFAULT;
 
-    *ppos += count;
+    if (data == '1')
+        gpio_set_value(LED_GPIO, 1);
+    else if (data == '0')
+        gpio_set_value(LED_GPIO, 0);
+    else
+        return -EINVAL;
+
     return count;
 }
 
@@ -69,14 +78,24 @@ static int __init gpio_event_init(void)
         goto err_cdev_del;
     }
 
+    ret = gpio_request(LED_GPIO, "gpio_event_led");
+    if (ret)
+        goto err_class_destroy;
+    
+    ret = gpio_direction_output(LED_GPIO, 0);
+    if (ret)
+        goto err_gpio_free;
+
     gpio_event_device = device_create(gpio_event_class, NULL, gpio_event_devt, NULL, DEV_NAME);
     if (IS_ERR(gpio_event_device)) {
         ret = PTR_ERR(gpio_event_device);
-        goto err_class_destroy;
+        goto err_gpio_free;
     }
 
     return 0;
 
+err_gpio_free:
+    gpio_free(LED_GPIO);
 err_class_destroy:
     class_destroy(gpio_event_class);
 err_cdev_del:
