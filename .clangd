@@ -1,0 +1,6 @@
+CompileFlags:
+  Remove:
+    - -fno-allow-store-data-races
+    - -fmin-function-alignment=*
+    - -fconserve-stack
+    - -mabi=*
