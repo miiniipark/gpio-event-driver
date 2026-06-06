@@ -108,6 +108,7 @@ err_unregister_chrdev:
 static void __exit gpio_event_exit(void)
 {
     device_destroy(gpio_event_class, gpio_event_devt);
+    gpio_free(LED_GPIO);
     class_destroy(gpio_event_class);
     cdev_del(&gpio_event_cdev);
     unregister_chrdev_region(gpio_event_devt, 1);
