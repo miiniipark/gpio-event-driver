@@ -5,17 +5,35 @@
 #include <linux/uaccess.h>
 #include <linux/err.h>
 #include <linux/gpio.h>
+#include <linux/interrupt.h>
 
 #define DEV_NAME "gpio_event"
 #define GPIO_BASE 512
 #define LED_GPIO_BCM 17
+#define BUTTON_GPIO_BCM 27
 #define LED_GPIO (GPIO_BASE + LED_GPIO_BCM)
+#define BUTTON_GPIO (GPIO_BASE + BUTTON_GPIO_BCM)
 
 static dev_t gpio_event_devt;
 static struct cdev gpio_event_cdev;
 static struct class *gpio_event_class;
 static struct device *gpio_event_device;
 static char data[32];
+static int button_irq;
+static int led_state;
+
+static irqreturn_t button_irq_handler(int irq, void *dev_id)
+{
+    int value = gpio_get_value(BUTTON_GPIO);
+
+    if (value) {
+        led_state = !led_state;
+        gpio_set_value(LED_GPIO, led_state);
+        pr_info("Button pressed, LED state: %d\n", led_state);
+    }
+
+    return IRQ_HANDLED;
+}
 
 static ssize_t gpio_event_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
@@ -84,17 +102,39 @@ static int __init gpio_event_init(void)
     
     ret = gpio_direction_output(LED_GPIO, 0);
     if (ret)
-        goto err_gpio_free;
+        goto err_gpio_free_led;
+
+    ret = gpio_request(BUTTON_GPIO, "gpio_event_button");
+    if (ret)
+        goto err_gpio_free_led;
+
+    ret = gpio_direction_input(BUTTON_GPIO);
+    if (ret)
+        goto err_gpio_free_button;
+
+    button_irq = gpio_to_irq(BUTTON_GPIO);
+    if (button_irq < 0) {
+        ret = button_irq;
+        goto err_gpio_free_button;
+    }
+
+    ret = request_irq(button_irq, button_irq_handler, IRQF_TRIGGER_RISING, "gpio_event_button_irq", NULL);
+    if (ret)
+        goto err_gpio_free_button;
 
     gpio_event_device = device_create(gpio_event_class, NULL, gpio_event_devt, NULL, DEV_NAME);
     if (IS_ERR(gpio_event_device)) {
         ret = PTR_ERR(gpio_event_device);
-        goto err_gpio_free;
+        goto err_free_button_irq;
     }
 
     return 0;
 
-err_gpio_free:
+err_free_button_irq:
+    free_irq(button_irq, NULL);
+err_gpio_free_button:
+    gpio_free(BUTTON_GPIO);
+err_gpio_free_led:
     gpio_free(LED_GPIO);
 err_class_destroy:
     class_destroy(gpio_event_class);
@@ -108,6 +148,8 @@ err_unregister_chrdev:
 static void __exit gpio_event_exit(void)
 {
     device_destroy(gpio_event_class, gpio_event_devt);
+    free_irq(button_irq, NULL);
+    gpio_free(BUTTON_GPIO);
     gpio_free(LED_GPIO);
     class_destroy(gpio_event_class);
     cdev_del(&gpio_event_cdev);
