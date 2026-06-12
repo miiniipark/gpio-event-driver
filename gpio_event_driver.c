@@ -11,6 +11,16 @@
 #include <linux/wait.h>
 #include <linux/spinlock.h>
 #include <linux/poll.h>
+#include <linux/ioctl.h>
+#include <linux/compiler.h>
+
+#define GPIO_EVENT_IOC_MAGIC 'g'
+#define GPIO_EVENT_IOC_SET_DEBOUNCE_MS _IOW(GPIO_EVENT_IOC_MAGIC, 1, unsigned int)
+#define GPIO_EVENT_IOC_GET_DEBOUNCE_MS _IOR(GPIO_EVENT_IOC_MAGIC, 2, unsigned int)
+
+#define DEFAULT_DEBOUNCE_MS 20
+#define MIN_DEBOUNCE_MS 0
+#define MAX_DEBOUNCE_MS 1000
 
 #define DEV_NAME "gpio_event"
 #define GPIO_BASE 512
@@ -18,14 +28,11 @@
 #define BUTTON_GPIO_BCM 27
 #define LED_GPIO (GPIO_BASE + LED_GPIO_BCM)
 #define BUTTON_GPIO (GPIO_BASE + BUTTON_GPIO_BCM)
-#define DEBOUNCE_MS 20
 #define GPIO_EVENT_FIFO_SIZE 32
 
 struct gpio_event {
-
 	u32 seq;
 	int value;
-
 };
 
 static DECLARE_KFIFO(gpio_event_fifo, struct gpio_event, GPIO_EVENT_FIFO_SIZE);
@@ -38,6 +45,7 @@ static struct class *gpio_event_class;
 static struct device *gpio_event_device;
 static int button_irq;
 static struct delayed_work button_debounce_work;
+static unsigned int debounce_ms = DEFAULT_DEBOUNCE_MS;
 
 static bool gpio_event_fifo_empty(void)
 {
@@ -53,7 +61,10 @@ static bool gpio_event_fifo_empty(void)
 
 static irqreturn_t button_irq_handler(int irq, void *dev_id)
 {
-    mod_delayed_work(system_wq, &button_debounce_work, msecs_to_jiffies(DEBOUNCE_MS));
+    unsigned int delay_ms = READ_ONCE(debounce_ms);
+
+    mod_delayed_work(system_wq, &button_debounce_work, msecs_to_jiffies(delay_ms));
+
     return IRQ_HANDLED;
 }
 
@@ -150,11 +161,42 @@ static __poll_t gpio_event_poll(struct file *file, poll_table *wait)
     return mask;
 }
 
+static long gpio_event_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    unsigned int value;
+
+    switch (cmd) {
+    case GPIO_EVENT_IOC_SET_DEBOUNCE_MS:
+        if (copy_from_user(&value, (unsigned int __user *)arg, sizeof(value)))
+            return -EFAULT;
+
+        if (value < MIN_DEBOUNCE_MS || value > MAX_DEBOUNCE_MS)
+            return -EINVAL;
+
+        WRITE_ONCE(debounce_ms, value);
+
+        pr_info("gpio_event: debounce_ms set to %u\n", value);
+        return 0;
+
+    case GPIO_EVENT_IOC_GET_DEBOUNCE_MS:
+        value = READ_ONCE(debounce_ms);
+
+        if (copy_to_user((unsigned int __user *)arg, &value, sizeof(value)))
+            return -EFAULT;
+
+        return 0;
+
+    default:
+        return -ENOTTY;
+    }
+}
+
 static const struct file_operations gpio_event_fops = {
     .owner = THIS_MODULE,
     .read = gpio_event_read,
     .write = gpio_event_write,
     .poll = gpio_event_poll,
+    .unlocked_ioctl = gpio_event_ioctl,
 };
 
 static int __init gpio_event_init(void)
