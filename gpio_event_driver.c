@@ -10,6 +10,7 @@
 #include <linux/kfifo.h>
 #include <linux/wait.h>
 #include <linux/spinlock.h>
+#include <linux/poll.h>
 
 #define DEV_NAME "gpio_event"
 #define GPIO_BASE 512
@@ -137,10 +138,23 @@ static ssize_t gpio_event_write(struct file *file, const char __user *buf, size_
     return count;
 }
 
+static __poll_t gpio_event_poll(struct file *file, poll_table *wait)
+{
+    __poll_t mask = 0;
+
+    poll_wait(file, &gpio_event_wq, wait);
+
+    if (!gpio_event_fifo_empty())
+        mask |= POLLIN | POLLRDNORM;
+
+    return mask;
+}
+
 static const struct file_operations gpio_event_fops = {
     .owner = THIS_MODULE,
     .read = gpio_event_read,
     .write = gpio_event_write,
+    .poll = gpio_event_poll,
 };
 
 static int __init gpio_event_init(void)
