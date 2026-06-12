@@ -7,6 +7,9 @@
 #include <linux/gpio.h>
 #include <linux/interrupt.h>
 #include <linux/workqueue.h>
+#include <linux/kfifo.h>
+#include <linux/wait.h>
+#include <linux/spinlock.h>
 
 #define DEV_NAME "gpio_event"
 #define GPIO_BASE 512
@@ -15,15 +18,37 @@
 #define LED_GPIO (GPIO_BASE + LED_GPIO_BCM)
 #define BUTTON_GPIO (GPIO_BASE + BUTTON_GPIO_BCM)
 #define DEBOUNCE_MS 20
+#define GPIO_EVENT_FIFO_SIZE 32
 
+struct gpio_event {
+
+	u32 seq;
+	int value;
+
+};
+
+static DECLARE_KFIFO(gpio_event_fifo, struct gpio_event, GPIO_EVENT_FIFO_SIZE);
+static DEFINE_SPINLOCK(gpio_event_lock);
+static DECLARE_WAIT_QUEUE_HEAD(gpio_event_wq);
+static u32 gpio_event_seq;
 static dev_t gpio_event_devt;
 static struct cdev gpio_event_cdev;
 static struct class *gpio_event_class;
 static struct device *gpio_event_device;
-static char data[32];
 static int button_irq;
-static int led_state;
 static struct delayed_work button_debounce_work;
+
+static bool gpio_event_fifo_empty(void)
+{
+	unsigned long flags;
+	bool empty;
+
+	spin_lock_irqsave(&gpio_event_lock, flags);
+	empty = kfifo_is_empty(&gpio_event_fifo);
+	spin_unlock_irqrestore(&gpio_event_lock, flags);
+	
+    return empty;
+}
 
 static irqreturn_t button_irq_handler(int irq, void *dev_id)
 {
@@ -33,26 +58,63 @@ static irqreturn_t button_irq_handler(int irq, void *dev_id)
 
 static void button_debounce_work_func(struct work_struct *work)
 {
-    if (!gpio_get_value(BUTTON_GPIO))
-        return;
+    struct gpio_event event;
+	unsigned long flags;
+	unsigned int copied;
 
-    led_state = !led_state;
-    gpio_set_value(LED_GPIO, led_state);
+	event.value = gpio_get_value(BUTTON_GPIO);
+
+	spin_lock_irqsave(&gpio_event_lock, flags);
+
+	event.seq = ++gpio_event_seq;
+	copied = kfifo_in(&gpio_event_fifo, &event, 1);
+
+	spin_unlock_irqrestore(&gpio_event_lock, flags);
+	
+    if (copied != 1) {
+		pr_warn("gpio_event: fifo full, event dropped\n");
+		return;
+	}
+
+	wake_up_interruptible(&gpio_event_wq);
+
+	pr_info("gpio_event: button event seq=%u value=%d\n",
+		event.seq, event.value);
 }
 
 static ssize_t gpio_event_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
-    if (*ppos >= sizeof(data))
-        return 0;
+    struct gpio_event event;
+	unsigned long flags;
+	unsigned int copied;
+	int ret;
 
-    if (count > sizeof(data) - *ppos)
-        count = sizeof(data) - *ppos;
+	if (count < sizeof(event))
+		return -EINVAL;
 
-    if (copy_to_user(buf, data + *ppos, count))
-        return -EFAULT;
+	if (file->f_flags & O_NONBLOCK) {
+		if (gpio_event_fifo_empty())
+			return -EAGAIN;
+	} else {
+		ret = wait_event_interruptible(
+			gpio_event_wq,
+			!gpio_event_fifo_empty());
 
-    *ppos += count;
-    return count;
+		if (ret)
+			return ret;
+	}
+
+	spin_lock_irqsave(&gpio_event_lock, flags);
+	copied = kfifo_out(&gpio_event_fifo, &event, 1);
+	spin_unlock_irqrestore(&gpio_event_lock, flags);
+
+	if (copied != 1)
+		return -EAGAIN;
+
+	if (copy_to_user(buf, &event, sizeof(event)))
+		return -EFAULT;
+    
+	return sizeof(event);
 }
 
 static ssize_t gpio_event_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
@@ -84,6 +146,9 @@ static const struct file_operations gpio_event_fops = {
 static int __init gpio_event_init(void)
 {
     int ret;
+
+	INIT_KFIFO(gpio_event_fifo);
+	gpio_event_seq = 0;
 
     ret = alloc_chrdev_region(&gpio_event_devt, 0, 1, DEV_NAME);
     if (ret)
@@ -125,7 +190,7 @@ static int __init gpio_event_init(void)
         goto err_gpio_free_button;
     }
 
-    ret = request_irq(button_irq, button_irq_handler, IRQF_TRIGGER_RISING, "gpio_event_button_irq", NULL);
+    ret = request_irq(button_irq, button_irq_handler, IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING, "gpio_event_button_irq", NULL);
     if (ret)
         goto err_gpio_free_button;
 
