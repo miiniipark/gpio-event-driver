@@ -13,6 +13,8 @@
 #include <linux/poll.h>
 #include <linux/ioctl.h>
 #include <linux/compiler.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
 
 #define GPIO_EVENT_IOC_MAGIC 'g'
 #define GPIO_EVENT_IOC_SET_DEBOUNCE_MS _IOW(GPIO_EVENT_IOC_MAGIC, 1, unsigned int)
@@ -46,6 +48,7 @@ static struct device *gpio_event_device;
 static int button_irq;
 static struct delayed_work button_debounce_work;
 static unsigned int debounce_ms = DEFAULT_DEBOUNCE_MS;
+static struct task_struct *gpio_event_thread;
 
 static bool gpio_event_fifo_empty(void)
 {
@@ -57,6 +60,32 @@ static bool gpio_event_fifo_empty(void)
 	spin_unlock_irqrestore(&gpio_event_lock, flags);
 	
     return empty;
+}
+
+static unsigned int gpio_event_fifo_len(void)
+{
+    unsigned long flags;
+    unsigned int len;
+
+    spin_lock_irqsave(&gpio_event_lock, flags);
+    len = kfifo_len(&gpio_event_fifo);
+    spin_unlock_irqrestore(&gpio_event_lock, flags);
+
+    return len;
+}
+
+static int gpio_event_thread_func(void *data)
+{
+    while (!kthread_should_stop()) {
+        pr_info("gpio_event: stats seq=%u fifo_len=%u debounce_ms=%u\n",
+                READ_ONCE(gpio_event_seq),
+                gpio_event_fifo_len(),
+                READ_ONCE(debounce_ms));
+
+        msleep(5000);
+    }
+
+    return 0;
 }
 
 static irqreturn_t button_irq_handler(int irq, void *dev_id)
@@ -250,14 +279,23 @@ static int __init gpio_event_init(void)
     if (ret)
         goto err_gpio_free_button;
 
+    gpio_event_thread = kthread_run(gpio_event_thread_func, NULL, "gpio_event_thread");
+    if (IS_ERR(gpio_event_thread)) {
+        ret = PTR_ERR(gpio_event_thread);
+        gpio_event_thread = NULL;
+        goto err_free_button_irq;
+    }
+
     gpio_event_device = device_create(gpio_event_class, NULL, gpio_event_devt, NULL, DEV_NAME);
     if (IS_ERR(gpio_event_device)) {
         ret = PTR_ERR(gpio_event_device);
-        goto err_free_button_irq;
+        goto err_stop_thread;
     }
 
     return 0;
 
+err_stop_thread:
+    kthread_stop(gpio_event_thread);
 err_free_button_irq:
     free_irq(button_irq, NULL);
 err_gpio_free_button:
@@ -276,6 +314,8 @@ err_unregister_chrdev:
 static void __exit gpio_event_exit(void)
 {
     device_destroy(gpio_event_class, gpio_event_devt);
+    if (gpio_event_thread)
+        kthread_stop(gpio_event_thread);
     free_irq(button_irq, NULL);
     cancel_delayed_work_sync(&button_debounce_work);
     gpio_free(BUTTON_GPIO);
