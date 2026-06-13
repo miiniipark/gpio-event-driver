@@ -123,6 +123,32 @@ static void button_debounce_work_func(struct work_struct *work)
 		event.seq, event.value);
 }
 
+static ssize_t debounce_ms_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    return sysfs_emit(buf, "%u\n", debounce_ms);
+}
+
+static ssize_t debounce_ms_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    unsigned int value;
+    int ret;
+
+    ret = kstrtouint(buf, 0, &value);
+    if (ret)
+        return ret;
+
+    if (value < MIN_DEBOUNCE_MS || value > MAX_DEBOUNCE_MS)
+        return -EINVAL;
+
+    debounce_ms = value;
+
+    pr_info("gpio_event_driver: debounce_ms set to %u\n", debounce_ms);
+
+    return count;
+}
+
+static DEVICE_ATTR_RW(debounce_ms);
+
 static ssize_t gpio_event_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
     struct gpio_event event;
@@ -292,8 +318,16 @@ static int __init gpio_event_init(void)
         goto err_stop_thread;
     }
 
+    ret = device_create_file(gpio_event_device, &dev_attr_debounce_ms);
+    if (ret) {
+        pr_err("gpio_event_driver: failed to create debounce_ms sysfs file\n");
+        goto err_device_destroy;
+    }
+
     return 0;
 
+err_device_destroy:
+    device_destroy(gpio_event_class, gpio_event_devt);
 err_stop_thread:
     kthread_stop(gpio_event_thread);
 err_free_button_irq:
@@ -313,6 +347,7 @@ err_unregister_chrdev:
 
 static void __exit gpio_event_exit(void)
 {
+    device_remove_file(gpio_event_device, &dev_attr_debounce_ms);
     device_destroy(gpio_event_class, gpio_event_devt);
     if (gpio_event_thread)
         kthread_stop(gpio_event_thread);
