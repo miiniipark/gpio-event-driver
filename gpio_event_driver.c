@@ -1,363 +1,488 @@
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/uaccess.h>
 #include <linux/err.h>
+
+#include <linux/platform_device.h>
+#include <linux/slab.h>
+
 #include <linux/gpio.h>
 #include <linux/interrupt.h>
-#include <linux/workqueue.h>
-#include <linux/kfifo.h>
+
 #include <linux/wait.h>
-#include <linux/spinlock.h>
 #include <linux/poll.h>
 #include <linux/ioctl.h>
+#include <linux/sysfs.h>
 #include <linux/compiler.h>
-#include <linux/kthread.h>
-#include <linux/delay.h>
+#include <linux/workqueue.h>
+#include <linux/jiffies.h>
 
-#define GPIO_EVENT_IOC_MAGIC 'g'
-#define GPIO_EVENT_IOC_SET_DEBOUNCE_MS _IOW(GPIO_EVENT_IOC_MAGIC, 1, unsigned int)
-#define GPIO_EVENT_IOC_GET_DEBOUNCE_MS _IOR(GPIO_EVENT_IOC_MAGIC, 2, unsigned int)
+#define GPIO_EVENT_NAME			"gpio-event"
+#define GPIO_EVENT_DEV_NAME		"gpio_event"
+#define GPIO_EVENT_CLASS_NAME		"gpio_event"
 
-#define DEFAULT_DEBOUNCE_MS 20
-#define MIN_DEBOUNCE_MS 0
-#define MAX_DEBOUNCE_MS 1000
+#define GPIO_EVENT_BUTTON_GPIO		539
+#define GPIO_EVENT_LED_GPIO		529
 
-#define DEV_NAME "gpio_event"
-#define GPIO_BASE 512
-#define LED_GPIO_BCM 17
-#define BUTTON_GPIO_BCM 27
-#define LED_GPIO (GPIO_BASE + LED_GPIO_BCM)
-#define BUTTON_GPIO (GPIO_BASE + BUTTON_GPIO_BCM)
-#define GPIO_EVENT_FIFO_SIZE 32
+#define GPIO_EVENT_FIFO_SIZE		16
 
-struct gpio_event {
-	u32 seq;
-	int value;
+#define GPIO_EVENT_DEFAULT_DEBOUNCE_MS	20
+#define GPIO_EVENT_MIN_DEBOUNCE_MS	1
+#define GPIO_EVENT_MAX_DEBOUNCE_MS	1000
+
+#define GPIO_EVENT_IOC_MAGIC		'g'
+#define GPIO_EVENT_IOC_SET_DEBOUNCE_MS	_IOW(GPIO_EVENT_IOC_MAGIC, 1, unsigned int)
+#define GPIO_EVENT_IOC_GET_DEBOUNCE_MS	_IOR(GPIO_EVENT_IOC_MAGIC, 2, unsigned int)
+
+struct gpio_event_pdata {
+	unsigned int button_gpio;
+	unsigned int led_gpio;
 };
 
-static DECLARE_KFIFO(gpio_event_fifo, struct gpio_event, GPIO_EVENT_FIFO_SIZE);
-static DEFINE_SPINLOCK(gpio_event_lock);
-static DECLARE_WAIT_QUEUE_HEAD(gpio_event_wq);
-static u32 gpio_event_seq;
+struct gpio_event {
+	struct device *dev;
+
+	unsigned int button_gpio;
+	unsigned int led_gpio;
+	int irq;
+
+	struct cdev cdev;
+	struct device *chardev;
+
+	wait_queue_head_t read_wq;
+	spinlock_t fifo_lock;
+	char fifo[GPIO_EVENT_FIFO_SIZE];
+	unsigned int head;
+	unsigned int tail;
+
+	struct delayed_work debounce_work;
+	unsigned int debounce_ms;
+};
+
 static dev_t gpio_event_devt;
-static struct cdev gpio_event_cdev;
 static struct class *gpio_event_class;
-static struct device *gpio_event_device;
-static int button_irq;
-static struct delayed_work button_debounce_work;
-static unsigned int debounce_ms = DEFAULT_DEBOUNCE_MS;
-static struct task_struct *gpio_event_thread;
+static struct platform_device *gpio_event_pdev;
 
-static bool gpio_event_fifo_empty(void)
+static const struct gpio_event_pdata gpio_event_pdata = {
+	.button_gpio = GPIO_EVENT_BUTTON_GPIO,
+	.led_gpio = GPIO_EVENT_LED_GPIO,
+};
+
+static bool gpio_event_fifo_empty(struct gpio_event *ge)
+{
+	return ge->head == ge->tail;
+}
+
+static bool gpio_event_fifo_full(struct gpio_event *ge)
+{
+	return ((ge->head + 1) % GPIO_EVENT_FIFO_SIZE) == ge->tail;
+}
+
+static bool gpio_event_has_data(struct gpio_event *ge)
 {
 	unsigned long flags;
-	bool empty;
+	bool has_data;
 
-	spin_lock_irqsave(&gpio_event_lock, flags);
-	empty = kfifo_is_empty(&gpio_event_fifo);
-	spin_unlock_irqrestore(&gpio_event_lock, flags);
-	
-    return empty;
+	spin_lock_irqsave(&ge->fifo_lock, flags);
+	has_data = !gpio_event_fifo_empty(ge);
+	spin_unlock_irqrestore(&ge->fifo_lock, flags);
+
+	return has_data;
 }
 
-static unsigned int gpio_event_fifo_len(void)
+static void gpio_event_fifo_push(struct gpio_event *ge, char val)
 {
-    unsigned long flags;
-    unsigned int len;
-
-    spin_lock_irqsave(&gpio_event_lock, flags);
-    len = kfifo_len(&gpio_event_fifo);
-    spin_unlock_irqrestore(&gpio_event_lock, flags);
-
-    return len;
-}
-
-static int gpio_event_thread_func(void *data)
-{
-    while (!kthread_should_stop()) {
-        pr_info("gpio_event: stats seq=%u fifo_len=%u debounce_ms=%u\n",
-                READ_ONCE(gpio_event_seq),
-                gpio_event_fifo_len(),
-                READ_ONCE(debounce_ms));
-
-        msleep(5000);
-    }
-
-    return 0;
-}
-
-static irqreturn_t button_irq_handler(int irq, void *dev_id)
-{
-    unsigned int delay_ms = READ_ONCE(debounce_ms);
-
-    mod_delayed_work(system_wq, &button_debounce_work, msecs_to_jiffies(delay_ms));
-
-    return IRQ_HANDLED;
-}
-
-static void button_debounce_work_func(struct work_struct *work)
-{
-    struct gpio_event event;
 	unsigned long flags;
-	unsigned int copied;
 
-	event.value = gpio_get_value(BUTTON_GPIO);
+	spin_lock_irqsave(&ge->fifo_lock, flags);
 
-	spin_lock_irqsave(&gpio_event_lock, flags);
+	if (gpio_event_fifo_full(ge))
+		ge->tail = (ge->tail + 1) % GPIO_EVENT_FIFO_SIZE;
 
-	event.seq = ++gpio_event_seq;
-	copied = kfifo_in(&gpio_event_fifo, &event, 1);
+	ge->fifo[ge->head] = val;
+	ge->head = (ge->head + 1) % GPIO_EVENT_FIFO_SIZE;
 
-	spin_unlock_irqrestore(&gpio_event_lock, flags);
-	
-    if (copied != 1) {
-		pr_warn("gpio_event: fifo full, event dropped\n");
-		return;
+	spin_unlock_irqrestore(&ge->fifo_lock, flags);
+}
+
+static int gpio_event_fifo_pop(struct gpio_event *ge, char *val)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&ge->fifo_lock, flags);
+
+	if (gpio_event_fifo_empty(ge)) {
+		ret = -ENOENT;
+		goto out;
 	}
 
-	wake_up_interruptible(&gpio_event_wq);
+	*val = ge->fifo[ge->tail];
+	ge->tail = (ge->tail + 1) % GPIO_EVENT_FIFO_SIZE;
 
-	pr_info("gpio_event: button event seq=%u value=%d\n",
-		event.seq, event.value);
+out:
+	spin_unlock_irqrestore(&ge->fifo_lock, flags);
+	return ret;
 }
 
-static ssize_t debounce_ms_show(struct device *dev, struct device_attribute *attr, char *buf)
+static int gpio_event_open(struct inode *inode, struct file *file)
 {
-    return sysfs_emit(buf, "%u\n", debounce_ms);
+	struct gpio_event *ge;
+
+	ge = container_of(inode->i_cdev, struct gpio_event, cdev);
+	file->private_data = ge;
+
+	return 0;
 }
 
-static ssize_t debounce_ms_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+static int gpio_event_release(struct inode *inode, struct file *file)
 {
-    unsigned int value;
-    int ret;
-
-    ret = kstrtouint(buf, 0, &value);
-    if (ret)
-        return ret;
-
-    if (value < MIN_DEBOUNCE_MS || value > MAX_DEBOUNCE_MS)
-        return -EINVAL;
-
-    debounce_ms = value;
-
-    pr_info("gpio_event_driver: debounce_ms set to %u\n", debounce_ms);
-
-    return count;
+	return 0;
 }
 
-static DEVICE_ATTR_RW(debounce_ms);
-
-static ssize_t gpio_event_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
+static ssize_t gpio_event_read(struct file *file,
+			       char __user *buf,
+			       size_t count,
+			       loff_t *ppos)
 {
-    struct gpio_event event;
-	unsigned long flags;
-	unsigned int copied;
+	struct gpio_event *ge = file->private_data;
+	char val;
 	int ret;
 
-	if (count < sizeof(event))
+	if (count < 1)
 		return -EINVAL;
 
-	if (file->f_flags & O_NONBLOCK) {
-		if (gpio_event_fifo_empty())
-			return -EAGAIN;
-	} else {
-		ret = wait_event_interruptible(
-			gpio_event_wq,
-			!gpio_event_fifo_empty());
+	for (;;) {
+		ret = gpio_event_fifo_pop(ge, &val);
+		if (!ret)
+			break;
 
+		if (file->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+
+		ret = wait_event_interruptible(ge->read_wq,
+					       gpio_event_has_data(ge));
 		if (ret)
 			return ret;
 	}
 
-	spin_lock_irqsave(&gpio_event_lock, flags);
-	copied = kfifo_out(&gpio_event_fifo, &event, 1);
-	spin_unlock_irqrestore(&gpio_event_lock, flags);
-
-	if (copied != 1)
-		return -EAGAIN;
-
-	if (copy_to_user(buf, &event, sizeof(event)))
+	if (copy_to_user(buf, &val, 1))
 		return -EFAULT;
-    
-	return sizeof(event);
-}
 
-static ssize_t gpio_event_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
-{
-    char data;
-
-    if (count < 1)
-        return -EINVAL;
-
-    if (copy_from_user(&data, buf, 1))
-        return -EFAULT;
-
-    if (data == '1')
-        gpio_set_value(LED_GPIO, 1);
-    else if (data == '0')
-        gpio_set_value(LED_GPIO, 0);
-    else
-        return -EINVAL;
-
-    return count;
+	return 1;
 }
 
 static __poll_t gpio_event_poll(struct file *file, poll_table *wait)
 {
-    __poll_t mask = 0;
+	struct gpio_event *ge = file->private_data;
+	__poll_t mask = 0;
 
-    poll_wait(file, &gpio_event_wq, wait);
+	poll_wait(file, &ge->read_wq, wait);
 
-    if (!gpio_event_fifo_empty())
-        mask |= POLLIN | POLLRDNORM;
+	if (gpio_event_has_data(ge))
+		mask |= EPOLLIN | EPOLLRDNORM;
 
-    return mask;
+	return mask;
 }
 
-static long gpio_event_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+static long gpio_event_ioctl(struct file *file,
+			     unsigned int cmd,
+			     unsigned long arg)
 {
-    unsigned int value;
+	struct gpio_event *ge = file->private_data;
+	unsigned int val;
 
-    switch (cmd) {
-    case GPIO_EVENT_IOC_SET_DEBOUNCE_MS:
-        if (copy_from_user(&value, (unsigned int __user *)arg, sizeof(value)))
-            return -EFAULT;
+	switch (cmd) {
+	case GPIO_EVENT_IOC_SET_DEBOUNCE_MS:
+		if (copy_from_user(&val, (unsigned int __user *)arg,
+				   sizeof(val)))
+			return -EFAULT;
 
-        if (value < MIN_DEBOUNCE_MS || value > MAX_DEBOUNCE_MS)
-            return -EINVAL;
+		if (val < GPIO_EVENT_MIN_DEBOUNCE_MS ||
+		    val > GPIO_EVENT_MAX_DEBOUNCE_MS)
+			return -EINVAL;
 
-        WRITE_ONCE(debounce_ms, value);
+		WRITE_ONCE(ge->debounce_ms, val);
+		return 0;
 
-        pr_info("gpio_event: debounce_ms set to %u\n", value);
-        return 0;
+	case GPIO_EVENT_IOC_GET_DEBOUNCE_MS:
+		val = READ_ONCE(ge->debounce_ms);
 
-    case GPIO_EVENT_IOC_GET_DEBOUNCE_MS:
-        value = READ_ONCE(debounce_ms);
+		if (copy_to_user((unsigned int __user *)arg, &val,
+				 sizeof(val)))
+			return -EFAULT;
 
-        if (copy_to_user((unsigned int __user *)arg, &value, sizeof(value)))
-            return -EFAULT;
+		return 0;
 
-        return 0;
-
-    default:
-        return -ENOTTY;
-    }
+	default:
+		return -ENOTTY;
+	}
 }
 
 static const struct file_operations gpio_event_fops = {
-    .owner = THIS_MODULE,
-    .read = gpio_event_read,
-    .write = gpio_event_write,
-    .poll = gpio_event_poll,
-    .unlocked_ioctl = gpio_event_ioctl,
+	.owner		= THIS_MODULE,
+	.open		= gpio_event_open,
+	.release	= gpio_event_release,
+	.read		= gpio_event_read,
+	.poll		= gpio_event_poll,
+	.unlocked_ioctl	= gpio_event_ioctl,
+};
+
+static ssize_t debounce_ms_show(struct device *dev,
+				struct device_attribute *attr,
+				char *buf)
+{
+	struct gpio_event *ge = dev_get_drvdata(dev);
+	unsigned int val;
+
+	val = READ_ONCE(ge->debounce_ms);
+
+	return sysfs_emit(buf, "%u\n", val);
+}
+
+static ssize_t debounce_ms_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf,
+				 size_t count)
+{
+	struct gpio_event *ge = dev_get_drvdata(dev);
+	unsigned int val;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	if (val < GPIO_EVENT_MIN_DEBOUNCE_MS ||
+	    val > GPIO_EVENT_MAX_DEBOUNCE_MS)
+		return -EINVAL;
+
+	WRITE_ONCE(ge->debounce_ms, val);
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(debounce_ms);
+
+static void gpio_event_debounce_work(struct work_struct *work)
+{
+	struct gpio_event *ge;
+	int val;
+
+	ge = container_of(to_delayed_work(work),
+			  struct gpio_event,
+			  debounce_work);
+
+	val = gpio_get_value(ge->button_gpio);
+	gpio_set_value(ge->led_gpio, val);
+
+	gpio_event_fifo_push(ge, val ? '1' : '0');
+	wake_up_interruptible(&ge->read_wq);
+}
+
+static irqreturn_t gpio_event_irq(int irq, void *dev_id)
+{
+	struct gpio_event *ge = dev_id;
+	unsigned int debounce_ms;
+
+	debounce_ms = READ_ONCE(ge->debounce_ms);
+
+	mod_delayed_work(system_wq,
+			 &ge->debounce_work,
+			 msecs_to_jiffies(debounce_ms));
+
+	return IRQ_HANDLED;
+}
+
+static int gpio_event_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	const struct gpio_event_pdata *pdata;
+	struct gpio_event *ge;
+	int ret;
+
+	pdata = dev_get_platdata(dev);
+	if (!pdata)
+		return -EINVAL;
+
+	ge = devm_kzalloc(dev, sizeof(*ge), GFP_KERNEL);
+	if (!ge)
+		return -ENOMEM;
+
+	ge->dev = dev;
+	ge->button_gpio = pdata->button_gpio;
+	ge->led_gpio = pdata->led_gpio;
+	ge->debounce_ms = GPIO_EVENT_DEFAULT_DEBOUNCE_MS;
+
+	spin_lock_init(&ge->fifo_lock);
+	init_waitqueue_head(&ge->read_wq);
+	INIT_DELAYED_WORK(&ge->debounce_work, gpio_event_debounce_work);
+
+	platform_set_drvdata(pdev, ge);
+
+	ret = devm_gpio_request_one(dev,
+				    ge->led_gpio,
+				    GPIOF_OUT_INIT_LOW,
+				    "gpio_event_led");
+	if (ret) {
+		dev_err(dev, "failed to request LED GPIO %u: %d\n",
+			ge->led_gpio, ret);
+		return ret;
+	}
+
+	ret = devm_gpio_request_one(dev,
+				    ge->button_gpio,
+				    GPIOF_IN,
+				    "gpio_event_button");
+	if (ret) {
+		dev_err(dev, "failed to request button GPIO %u: %d\n",
+			ge->button_gpio, ret);
+		return ret;
+	}
+
+	ge->irq = gpio_to_irq(ge->button_gpio);
+	if (ge->irq < 0) {
+		dev_err(dev, "failed to get IRQ from GPIO %u: %d\n",
+			ge->button_gpio, ge->irq);
+		return ge->irq;
+	}
+
+	ret = devm_request_irq(dev,
+			       ge->irq,
+			       gpio_event_irq,
+			       IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
+			       GPIO_EVENT_NAME,
+			       ge);
+	if (ret) {
+		dev_err(dev, "failed to request IRQ %d: %d\n",
+			ge->irq, ret);
+		return ret;
+	}
+
+	cdev_init(&ge->cdev, &gpio_event_fops);
+	ge->cdev.owner = THIS_MODULE;
+
+	ret = cdev_add(&ge->cdev, gpio_event_devt, 1);
+	if (ret) {
+		dev_err(dev, "failed to add cdev: %d\n", ret);
+		return ret;
+	}
+
+	ge->chardev = device_create(gpio_event_class,
+				    dev,
+				    gpio_event_devt,
+				    ge,
+				    GPIO_EVENT_DEV_NAME);
+	if (IS_ERR(ge->chardev)) {
+		ret = PTR_ERR(ge->chardev);
+		dev_err(dev, "failed to create device: %d\n", ret);
+		goto err_cdev_del;
+	}
+
+	ret = device_create_file(ge->chardev, &dev_attr_debounce_ms);
+	if (ret) {
+		dev_err(dev, "failed to create debounce_ms sysfs: %d\n", ret);
+		goto err_device_destroy;
+	}
+
+	dev_info(dev, "probed: button_gpio=%u led_gpio=%u irq=%d\n",
+		 ge->button_gpio, ge->led_gpio, ge->irq);
+
+	return 0;
+
+err_device_destroy:
+	device_destroy(gpio_event_class, gpio_event_devt);
+
+err_cdev_del:
+	cdev_del(&ge->cdev);
+
+	return ret;
+}
+
+static void gpio_event_remove(struct platform_device *pdev)
+{
+	struct gpio_event *ge = platform_get_drvdata(pdev);
+
+	if (!ge)
+		return;
+
+	devm_free_irq(&pdev->dev, ge->irq, ge);
+	cancel_delayed_work_sync(&ge->debounce_work);
+
+	device_remove_file(ge->chardev, &dev_attr_debounce_ms);
+	device_destroy(gpio_event_class, gpio_event_devt);
+	cdev_del(&ge->cdev);
+
+	dev_info(&pdev->dev, "removed\n");
+}
+
+static struct platform_driver gpio_event_driver = {
+	.probe = gpio_event_probe,
+	.remove = gpio_event_remove,
+	.driver = {
+		.name = GPIO_EVENT_NAME,
+	},
 };
 
 static int __init gpio_event_init(void)
 {
-    int ret;
+	int ret;
 
-	INIT_KFIFO(gpio_event_fifo);
-	gpio_event_seq = 0;
+	ret = alloc_chrdev_region(&gpio_event_devt,
+				  0,
+				  1,
+				  GPIO_EVENT_DEV_NAME);
+	if (ret)
+		return ret;
 
-    ret = alloc_chrdev_region(&gpio_event_devt, 0, 1, DEV_NAME);
-    if (ret)
-        return ret;
-    
-    cdev_init(&gpio_event_cdev, &gpio_event_fops);
+	gpio_event_class = class_create(GPIO_EVENT_CLASS_NAME);
+	if (IS_ERR(gpio_event_class)) {
+		ret = PTR_ERR(gpio_event_class);
+		goto err_unregister_chrdev;
+	}
 
-    ret = cdev_add(&gpio_event_cdev, gpio_event_devt, 1);
-    if (ret)
-        goto err_unregister_chrdev;
+	ret = platform_driver_register(&gpio_event_driver);
+	if (ret)
+		goto err_class_destroy;
 
-    gpio_event_class = class_create(DEV_NAME);
-    if (IS_ERR(gpio_event_class)) {
-        ret = PTR_ERR(gpio_event_class);
-        goto err_cdev_del;
-    }
+	gpio_event_pdev = platform_device_register_data(NULL,
+							GPIO_EVENT_NAME,
+							PLATFORM_DEVID_NONE,
+							&gpio_event_pdata,
+							sizeof(gpio_event_pdata));
+	if (IS_ERR(gpio_event_pdev)) {
+		ret = PTR_ERR(gpio_event_pdev);
+		goto err_unregister_driver;
+	}
 
-    ret = gpio_request(LED_GPIO, "gpio_event_led");
-    if (ret)
-        goto err_class_destroy;
-    
-    ret = gpio_direction_output(LED_GPIO, 0);
-    if (ret)
-        goto err_gpio_free_led;
+	pr_info("loaded\n");
 
-    ret = gpio_request(BUTTON_GPIO, "gpio_event_button");
-    if (ret)
-        goto err_gpio_free_led;
+	return 0;
 
-    ret = gpio_direction_input(BUTTON_GPIO);
-    if (ret)
-        goto err_gpio_free_button;
+err_unregister_driver:
+	platform_driver_unregister(&gpio_event_driver);
 
-    INIT_DELAYED_WORK(&button_debounce_work, button_debounce_work_func);
-
-    button_irq = gpio_to_irq(BUTTON_GPIO);
-    if (button_irq < 0) {
-        ret = button_irq;
-        goto err_gpio_free_button;
-    }
-
-    ret = request_irq(button_irq, button_irq_handler, IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING, "gpio_event_button_irq", NULL);
-    if (ret)
-        goto err_gpio_free_button;
-
-    gpio_event_thread = kthread_run(gpio_event_thread_func, NULL, "gpio_event_thread");
-    if (IS_ERR(gpio_event_thread)) {
-        ret = PTR_ERR(gpio_event_thread);
-        gpio_event_thread = NULL;
-        goto err_free_button_irq;
-    }
-
-    gpio_event_device = device_create(gpio_event_class, NULL, gpio_event_devt, NULL, DEV_NAME);
-    if (IS_ERR(gpio_event_device)) {
-        ret = PTR_ERR(gpio_event_device);
-        goto err_stop_thread;
-    }
-
-    ret = device_create_file(gpio_event_device, &dev_attr_debounce_ms);
-    if (ret) {
-        pr_err("gpio_event_driver: failed to create debounce_ms sysfs file\n");
-        goto err_device_destroy;
-    }
-
-    return 0;
-
-err_device_destroy:
-    device_destroy(gpio_event_class, gpio_event_devt);
-err_stop_thread:
-    kthread_stop(gpio_event_thread);
-err_free_button_irq:
-    free_irq(button_irq, NULL);
-err_gpio_free_button:
-    gpio_free(BUTTON_GPIO);
-err_gpio_free_led:
-    gpio_free(LED_GPIO);
 err_class_destroy:
-    class_destroy(gpio_event_class);
-err_cdev_del:
-    cdev_del(&gpio_event_cdev);
+	class_destroy(gpio_event_class);
+
 err_unregister_chrdev:
-    unregister_chrdev_region(gpio_event_devt, 1);
-    return ret;
+	unregister_chrdev_region(gpio_event_devt, 1);
+
+	return ret;
 }
 
 static void __exit gpio_event_exit(void)
 {
-    device_remove_file(gpio_event_device, &dev_attr_debounce_ms);
-    device_destroy(gpio_event_class, gpio_event_devt);
-    if (gpio_event_thread)
-        kthread_stop(gpio_event_thread);
-    free_irq(button_irq, NULL);
-    cancel_delayed_work_sync(&button_debounce_work);
-    gpio_free(BUTTON_GPIO);
-    gpio_free(LED_GPIO);
-    class_destroy(gpio_event_class);
-    cdev_del(&gpio_event_cdev);
-    unregister_chrdev_region(gpio_event_devt, 1);
+	platform_device_unregister(gpio_event_pdev);
+	platform_driver_unregister(&gpio_event_driver);
+	class_destroy(gpio_event_class);
+	unregister_chrdev_region(gpio_event_devt, 1);
+
+	pr_info("unloaded\n");
 }
 
 module_init(gpio_event_init);
@@ -365,4 +490,4 @@ module_exit(gpio_event_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("miiniipark");
-MODULE_DESCRIPTION("GPIO Event Driver");
+MODULE_DESCRIPTION("GPIO Event platform driver");
