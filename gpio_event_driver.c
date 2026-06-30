@@ -298,6 +298,14 @@ static irqreturn_t gpio_event_irq(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+static void gpio_event_irq_work_cleanup(void *data)
+{
+	struct gpio_event *ge = data;
+
+	devm_free_irq(ge->dev, ge->irq, ge);
+	cancel_delayed_work_sync(&ge->debounce_work);
+}
+
 static int gpio_event_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -363,6 +371,12 @@ static int gpio_event_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	ret = devm_add_action_or_reset(dev, gpio_event_irq_work_cleanup, ge);
+	if (ret) {
+		dev_err(dev, "failed to add IRQ/work cleanup action: %d\n", ret);
+		return ret;
+	}
+
 	cdev_init(&ge->cdev, &gpio_event_fops);
 	ge->cdev.owner = THIS_MODULE;
 
@@ -410,8 +424,7 @@ static void gpio_event_remove(struct platform_device *pdev)
 	if (!ge)
 		return;
 
-	devm_free_irq(&pdev->dev, ge->irq, ge);
-	cancel_delayed_work_sync(&ge->debounce_work);
+	devm_release_action(&pdev->dev, gpio_event_irq_work_cleanup, ge);
 
 	device_remove_file(ge->chardev, &dev_attr_debounce_ms);
 	device_destroy(gpio_event_class, gpio_event_devt);
