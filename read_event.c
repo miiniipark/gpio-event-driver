@@ -151,14 +151,14 @@ int main(int argc, char *argv[])
 		print_timestamp();
 
 		if (value == '1') {
-			printf("event=%ld button_value=1 state=HIGH\n",
-			       event_count);
+			printf("event=%ld button_value=1 state=PRESSED\n",
+				event_count);
 		} else if (value == '0') {
-			printf("event=%ld button_value=0 state=LOW\n",
-			       event_count);
+			printf("event=%ld button_value=0 state=RELEASED\n",
+				event_count);
 		} else {
 			printf("event=%ld unknown_value=0x%02x\n",
-			       event_count, (unsigned char)value);
+				event_count, (unsigned char)value);
 		}
 	}
 

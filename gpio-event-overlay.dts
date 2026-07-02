@@ -1,0 +1,51 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		target = <&gpio>;
+		__overlay__ {
+			gpio_event_button_pins: gpio-event-button-pins {
+				brcm,pins = <27>;
+				brcm,function = <0>; /* input */
+				brcm,pull = <2>;     /* pull-up */
+			};
+
+			gpio_event_led_pins: gpio-event-led-pins {
+				brcm,pins = <17>;
+				brcm,function = <1>; /* output */
+				brcm,pull = <0>;     /* no pull */
+			};
+		};
+	};
+
+	fragment@1 {
+		target-path = "/";
+		__overlay__ {
+			gpio_event: gpio-event {
+				compatible = "miiniipark,gpio-event";
+
+				pinctrl-names = "default";
+				pinctrl-0 = <&gpio_event_button_pins
+					     &gpio_event_led_pins>;
+
+				/*
+				 * Raspberry Pi BCM GPIO numbering.
+				 *
+				 * button = GPIO27, internal pull-up, active-low
+				 * led    = GPIO17, active-high
+				 *
+				 * GPIO flags:
+				 * 0 = GPIO_ACTIVE_HIGH
+				 * 1 = GPIO_ACTIVE_LOW
+				 */
+				button-gpios = <&gpio 27 1>;
+				led-gpios = <&gpio 17 0>;
+
+				status = "okay";
+			};
+		};
+	};
+};

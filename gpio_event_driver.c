@@ -8,9 +8,10 @@
 #include <linux/err.h>
 
 #include <linux/platform_device.h>
+#include <linux/of.h>
 #include <linux/slab.h>
 
-#include <linux/gpio.h>
+#include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 
 #include <linux/wait.h>
@@ -25,9 +26,6 @@
 #define GPIO_EVENT_DEV_NAME		"gpio_event"
 #define GPIO_EVENT_CLASS_NAME		"gpio_event"
 
-#define GPIO_EVENT_BUTTON_GPIO		539
-#define GPIO_EVENT_LED_GPIO		529
-
 #define GPIO_EVENT_FIFO_SIZE		16
 
 #define GPIO_EVENT_DEFAULT_DEBOUNCE_MS	20
@@ -38,16 +36,11 @@
 #define GPIO_EVENT_IOC_SET_DEBOUNCE_MS	_IOW(GPIO_EVENT_IOC_MAGIC, 1, unsigned int)
 #define GPIO_EVENT_IOC_GET_DEBOUNCE_MS	_IOR(GPIO_EVENT_IOC_MAGIC, 2, unsigned int)
 
-struct gpio_event_pdata {
-	unsigned int button_gpio;
-	unsigned int led_gpio;
-};
-
 struct gpio_event {
 	struct device *dev;
 
-	unsigned int button_gpio;
-	unsigned int led_gpio;
+	struct gpio_desc *button_gpiod;
+	struct gpio_desc *led_gpiod;
 	int irq;
 
 	struct cdev cdev;
@@ -65,12 +58,6 @@ struct gpio_event {
 
 static dev_t gpio_event_devt;
 static struct class *gpio_event_class;
-static struct platform_device *gpio_event_pdev;
-
-static const struct gpio_event_pdata gpio_event_pdata = {
-	.button_gpio = GPIO_EVENT_BUTTON_GPIO,
-	.led_gpio = GPIO_EVENT_LED_GPIO,
-};
 
 static bool gpio_event_fifo_empty(struct gpio_event *ge)
 {
@@ -277,8 +264,13 @@ static void gpio_event_debounce_work(struct work_struct *work)
 			  struct gpio_event,
 			  debounce_work);
 
-	val = gpio_get_value(ge->button_gpio);
-	gpio_set_value(ge->led_gpio, val);
+	val = gpiod_get_value_cansleep(ge->button_gpiod);
+	if (val < 0) {
+		dev_err(ge->dev, "failed to get button GPIO value: %d\n", val);
+		return;
+	}
+
+	gpiod_set_value_cansleep(ge->led_gpiod, val);
 
 	gpio_event_fifo_push(ge, val ? '1' : '0');
 	wake_up_interruptible(&ge->read_wq);
@@ -309,21 +301,14 @@ static void gpio_event_irq_work_cleanup(void *data)
 static int gpio_event_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	const struct gpio_event_pdata *pdata;
 	struct gpio_event *ge;
 	int ret;
-
-	pdata = dev_get_platdata(dev);
-	if (!pdata)
-		return -EINVAL;
 
 	ge = devm_kzalloc(dev, sizeof(*ge), GFP_KERNEL);
 	if (!ge)
 		return -ENOMEM;
 
 	ge->dev = dev;
-	ge->button_gpio = pdata->button_gpio;
-	ge->led_gpio = pdata->led_gpio;
 	ge->debounce_ms = GPIO_EVENT_DEFAULT_DEBOUNCE_MS;
 
 	spin_lock_init(&ge->fifo_lock);
@@ -332,30 +317,24 @@ static int gpio_event_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, ge);
 
-	ret = devm_gpio_request_one(dev,
-				    ge->led_gpio,
-				    GPIOF_OUT_INIT_LOW,
-				    "gpio_event_led");
-	if (ret) {
-		dev_err(dev, "failed to request LED GPIO %u: %d\n",
-			ge->led_gpio, ret);
+	ge->led_gpiod = devm_gpiod_get(dev, "led", GPIOD_OUT_LOW);
+	if (IS_ERR(ge->led_gpiod)) {
+		ret = PTR_ERR(ge->led_gpiod);
+		dev_err(dev, "failed to get LED GPIO: %d\n", ret);
 		return ret;
 	}
 
-	ret = devm_gpio_request_one(dev,
-				    ge->button_gpio,
-				    GPIOF_IN,
-				    "gpio_event_button");
-	if (ret) {
-		dev_err(dev, "failed to request button GPIO %u: %d\n",
-			ge->button_gpio, ret);
+	ge->button_gpiod = devm_gpiod_get(dev, "button", GPIOD_IN);
+	if (IS_ERR(ge->button_gpiod)) {
+		ret = PTR_ERR(ge->button_gpiod);
+		dev_err(dev, "failed to get button GPIO: %d\n", ret);
 		return ret;
 	}
 
-	ge->irq = gpio_to_irq(ge->button_gpio);
+	ge->irq = gpiod_to_irq(ge->button_gpiod);
 	if (ge->irq < 0) {
-		dev_err(dev, "failed to get IRQ from GPIO %u: %d\n",
-			ge->button_gpio, ge->irq);
+		dev_err(dev, "failed to get IRQ from button GPIO: %d\n",
+			ge->irq);
 		return ge->irq;
 	}
 
@@ -403,8 +382,7 @@ static int gpio_event_probe(struct platform_device *pdev)
 		goto err_device_destroy;
 	}
 
-	dev_info(dev, "probed: button_gpio=%u led_gpio=%u irq=%d\n",
-		 ge->button_gpio, ge->led_gpio, ge->irq);
+	dev_info(dev, "probed: irq=%d\n", ge->irq);
 
 	return 0;
 
@@ -433,11 +411,18 @@ static void gpio_event_remove(struct platform_device *pdev)
 	dev_info(&pdev->dev, "removed\n");
 }
 
+static const struct of_device_id gpio_event_of_match[] = {
+	{ .compatible = "miiniipark,gpio-event" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, gpio_event_of_match);
+
 static struct platform_driver gpio_event_driver = {
 	.probe = gpio_event_probe,
 	.remove = gpio_event_remove,
 	.driver = {
 		.name = GPIO_EVENT_NAME,
+		.of_match_table = gpio_event_of_match,
 	},
 };
 
@@ -462,22 +447,9 @@ static int __init gpio_event_init(void)
 	if (ret)
 		goto err_class_destroy;
 
-	gpio_event_pdev = platform_device_register_data(NULL,
-							GPIO_EVENT_NAME,
-							PLATFORM_DEVID_NONE,
-							&gpio_event_pdata,
-							sizeof(gpio_event_pdata));
-	if (IS_ERR(gpio_event_pdev)) {
-		ret = PTR_ERR(gpio_event_pdev);
-		goto err_unregister_driver;
-	}
-
 	pr_info("loaded\n");
 
 	return 0;
-
-err_unregister_driver:
-	platform_driver_unregister(&gpio_event_driver);
 
 err_class_destroy:
 	class_destroy(gpio_event_class);
@@ -490,7 +462,6 @@ err_unregister_chrdev:
 
 static void __exit gpio_event_exit(void)
 {
-	platform_device_unregister(gpio_event_pdev);
 	platform_driver_unregister(&gpio_event_driver);
 	class_destroy(gpio_event_class);
 	unregister_chrdev_region(gpio_event_devt, 1);
