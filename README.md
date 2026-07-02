@@ -2,16 +2,17 @@
 
 Raspberry Pi의 GPIO 버튼 입력을 Linux character device로 전달하는 GPIO event driver 예제입니다.
 
-이 프로젝트는 GPIO interrupt, debounce 처리, wait queue, `poll()`, sysfs, ioctl, platform driver, devm API, Device Tree overlay, gpiod descriptor API를 단계적으로 적용하며 Linux device driver 구조를 학습하기 위한 프로젝트입니다.
+이 프로젝트는 GPIO interrupt, debounce 처리, wait queue, `poll()`, sysfs, `ioctl`, platform driver, devm API, Device Tree overlay, `gpiod` descriptor API를 단계적으로 적용하며 Linux device driver 구조를 학습하기 위한 프로젝트입니다.
 
-최종 구현은 Device Tree overlay를 통해 button/LED GPIO를 정의하고, 드라이버에서는 `devm_gpiod_get()` 기반 gpiod API로 GPIO를 제어합니다.
+최종 구현은 Device Tree overlay를 통해 button/LED GPIO를 정의하고, 드라이버에서는 `devm_gpiod_get()` 기반 `gpiod` API로 GPIO를 제어합니다.
 
 ## Features
 
 - Linux kernel module 기반 GPIO event driver
-- `platform_driver` 기반 probe/remove 구조
-- Device Tree overlay 기반 device 생성
-- gpiod descriptor API 기반 GPIO 제어
+- `platform_driver` 기반 `probe()` / `remove()` 구조
+- Device Tree overlay 기반 platform device 생성
+- `gpiod` descriptor API 기반 GPIO 제어
+- Device Tree `compatible`과 module alias 기반 자동 모듈 로드 지원
 - Button GPIO interrupt 처리
 - Rising/Falling edge interrupt 지원
 - `delayed_work` 기반 software debounce
@@ -20,7 +21,7 @@ Raspberry Pi의 GPIO 버튼 입력을 Linux character device로 전달하는 GPI
 - `poll()` / `select()` / `epoll()` 지원
 - 버튼 상태에 따른 LED 상태 동기화
 - `debounce_ms` sysfs attribute 지원
-- `debounce_ms` ioctl SET/GET 지원
+- `debounce_ms` `ioctl` SET/GET 지원
 - 유저 공간 테스트 프로그램 `read_event` 제공
 
 ## Hardware
@@ -75,7 +76,7 @@ GPIO17 HIGH → LED ON
 GPIO17 LOW  → LED OFF
 ```
 
-일반적으로 LED 직렬 저항은 220Ω ~ 1kΩ 범위에서 사용합니다.
+일반적으로 LED 직렬 저항은 `220Ω` ~ `1kΩ` 범위에서 사용합니다.
 
 ## Project Files
 
@@ -223,7 +224,7 @@ sudo reboot
 ls /proc/device-tree/gpio-event
 ```
 
-compatible 값을 확인하려면:
+`compatible` 값을 확인하려면:
 
 ```bash
 tr -d '\0' < /proc/device-tree/gpio-event/compatible
@@ -235,12 +236,105 @@ tr -d '\0' < /proc/device-tree/gpio-event/compatible
 miiniipark,gpio-event
 ```
 
-## Load Kernel Module
+## Install Kernel Module
 
-Device Tree overlay 적용 후 커널 모듈을 로드합니다.
+개발 중에는 현재 디렉터리의 `.ko` 파일을 직접 로드할 수 있습니다.
 
 ```bash
 sudo insmod gpio_event_driver.ko
+```
+
+Device Tree overlay와 함께 자동 로드를 확인하려면 모듈을 커널 모듈 디렉터리에 설치하고 `depmod`를 실행합니다.
+
+```bash
+sudo mkdir -p /lib/modules/$(uname -r)/extra
+sudo cp gpio_event_driver.ko /lib/modules/$(uname -r)/extra/
+sudo depmod -a
+```
+
+또는 `install` 명령으로 한 번에 복사할 수 있습니다.
+
+```bash
+sudo install -D -m 644 gpio_event_driver.ko \
+	/lib/modules/$(uname -r)/extra/gpio_event_driver.ko
+sudo depmod -a
+```
+
+모듈 alias가 등록되었는지 확인합니다.
+
+```bash
+modinfo gpio_event_driver | grep alias
+```
+
+기대되는 alias는 다음과 같은 형태입니다.
+
+```text
+alias:          of:N*T*Cmiiniipark,gpio-eventC*
+alias:          of:N*T*Cmiiniipark,gpio-event
+```
+
+이 alias는 드라이버의 `MODULE_DEVICE_TABLE(of, ...)`와 Device Tree의 `compatible = "miiniipark,gpio-event";`를 기반으로 생성됩니다.
+
+## Module Loading Flow
+
+`dtoverlay`와 kernel module은 역할이 다릅니다.
+
+```text
+dtoverlay=gpio-event
+        ↓
+Device Tree에 gpio-event node 추가
+        ↓
+platform bus가 platform device 생성
+        ↓
+compatible = "miiniipark,gpio-event"
+```
+
+드라이버 모듈이 로드되면 `of_match_table`과 Device Tree `compatible`이 매칭되어 `probe()`가 호출됩니다.
+
+```text
+gpio_event_driver.ko 로드
+        ↓
+platform_driver_register()
+        ↓
+of_match_table match
+        ↓
+gpio_event_probe()
+        ↓
+/dev/gpio_event 생성
+```
+
+모듈을 `/lib/modules/$(uname -r)/extra/`에 설치하고 `depmod -a`를 실행하면, 부팅 중 Device Tree node의 `modalias`를 기반으로 `udev`/`kmod`가 모듈을 자동 로드할 수 있습니다.
+
+수동으로 로드할 수도 있습니다.
+
+```bash
+sudo modprobe gpio_event_driver
+```
+
+수동으로 언로드하려면:
+
+```bash
+sudo modprobe -r gpio_event_driver
+```
+
+현재 platform device의 `modalias`는 다음 명령으로 확인할 수 있습니다.
+
+```bash
+cat /sys/bus/platform/devices/gpio-event/modalias
+```
+
+## Load Kernel Module Manually
+
+자동 로드 설정을 사용하지 않는 경우, Device Tree overlay 적용 후 직접 모듈을 로드합니다.
+
+```bash
+sudo insmod gpio_event_driver.ko
+```
+
+모듈을 설치한 뒤에는 `modprobe`로 로드할 수 있습니다.
+
+```bash
+sudo modprobe gpio_event_driver
 ```
 
 커널 로그를 확인합니다.
@@ -249,7 +343,7 @@ sudo insmod gpio_event_driver.ko
 dmesg | tail -n 30
 ```
 
-정상적으로 probe되면 `/dev/gpio_event`가 생성됩니다.
+정상적으로 `probe()`되면 `/dev/gpio_event`가 생성됩니다.
 
 ```bash
 ls -l /dev/gpio_event
@@ -257,8 +351,16 @@ ls -l /dev/gpio_event
 
 ## Unload Kernel Module
 
+`insmod`로 로드한 경우:
+
 ```bash
 sudo rmmod gpio_event_driver
+```
+
+`modprobe`로 로드한 경우:
+
+```bash
+sudo modprobe -r gpio_event_driver
 ```
 
 커널 로그를 확인합니다.
@@ -288,7 +390,7 @@ dmesg | tail -n 30
 
 ### Sysfs
 
-debounce 시간은 sysfs attribute로 확인하거나 변경할 수 있습니다.
+Debounce 시간은 sysfs attribute로 확인하거나 변경할 수 있습니다.
 
 ```text
 /sys/class/gpio_event/gpio_event/debounce_ms
@@ -300,7 +402,7 @@ debounce 시간은 sysfs attribute로 확인하거나 변경할 수 있습니다
 cat /sys/class/gpio_event/gpio_event/debounce_ms
 ```
 
-debounce 값을 50ms로 변경:
+Debounce 값을 `50ms`로 변경:
 
 ```bash
 echo 50 | sudo tee /sys/class/gpio_event/gpio_event/debounce_ms
@@ -320,7 +422,7 @@ echo 50 | sudo tee /sys/class/gpio_event/gpio_event/debounce_ms
 
 ### ioctl
 
-드라이버는 debounce 설정을 위한 ioctl도 지원합니다.
+드라이버는 debounce 설정을 위한 `ioctl`도 지원합니다.
 
 ```c
 #define GPIO_EVENT_IOC_MAGIC            'g'
@@ -362,7 +464,7 @@ Press Ctrl+C to stop.
 ./read_event -t 5000
 ```
 
-device path 직접 지정:
+Device path 직접 지정:
 
 ```bash
 ./read_event -d /dev/gpio_event
@@ -470,7 +572,8 @@ IRQ와 delayed work는 cleanup action으로 묶어 정리합니다. IRQ를 먼�
 12. Device Tree overlay 추가
 13. legacy GPIO number API에서 gpiod descriptor API로 전환
 14. 내부 pull-up + active-low 버튼 회로 적용
-15. read_event 테스트 프로그램으로 실제 보드 동작 검증
+15. Device Tree compatible 기반 module alias 및 자동 로드 흐름 확인
+16. read_event 테스트 프로그램으로 실제 보드 동작 검증
 ```
 
 ## Current Status
@@ -487,6 +590,8 @@ LED:    GPIO17, active-high
 ```text
 - Device Tree overlay 적용
 - platform_driver probe 동작
+- module alias 기반 modprobe 로드
+- Device Tree modalias 기반 자동 모듈 로드
 - /dev/gpio_event 생성
 - button press/release 이벤트 read
 - poll 기반 이벤트 대기
