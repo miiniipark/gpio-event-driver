@@ -1,299 +1,496 @@
 # GPIO Event Driver
 
-Linux Device Driver 학습을 위해 단계적으로 구현한 GPIO Event Driver 프로젝트입니다.
+Raspberry Pi의 GPIO 버튼 입력을 Linux character device로 전달하는 GPIO event driver 예제입니다.
 
-Character Device부터 시작하여 GPIO Interrupt, Wait Queue, Poll, ioctl, Kernel Thread, Sysfs까지 Linux 디바이스 드라이버의 핵심 기능을 직접 구현하고 실습하는 것을 목표로 하였습니다.
+이 프로젝트는 GPIO interrupt, debounce 처리, wait queue, `poll()`, sysfs, ioctl, platform driver, devm API, Device Tree overlay, gpiod descriptor API를 단계적으로 적용하며 Linux device driver 구조를 학습하기 위한 프로젝트입니다.
 
----
+최종 구현은 Device Tree overlay를 통해 button/LED GPIO를 정의하고, 드라이버에서는 `devm_gpiod_get()` 기반 gpiod API로 GPIO를 제어합니다.
 
-## 주요 기능
+## Features
 
-- Character Device (`/dev/gpio_event`)
-- GPIO Interrupt 처리
-- Software Debounce
-- Event FIFO (`kfifo`)
-- Blocking Read
-- Poll 지원
-- LED 제어
-- ioctl을 통한 debounce 설정
-- sysfs를 통한 debounce 설정
-- Kernel Thread 기반 상태 출력
+- Linux kernel module 기반 GPIO event driver
+- `platform_driver` 기반 probe/remove 구조
+- Device Tree overlay 기반 device 생성
+- gpiod descriptor API 기반 GPIO 제어
+- Button GPIO interrupt 처리
+- Rising/Falling edge interrupt 지원
+- `delayed_work` 기반 software debounce
+- 내부 FIFO 기반 버튼 이벤트 저장
+- blocking / non-blocking `read()` 지원
+- `poll()` / `select()` / `epoll()` 지원
+- 버튼 상태에 따른 LED 상태 동기화
+- `debounce_ms` sysfs attribute 지원
+- `debounce_ms` ioctl SET/GET 지원
+- 유저 공간 테스트 프로그램 `read_event` 제공
 
----
+## Hardware
 
-## 개발 환경
+현재 테스트한 GPIO 구성은 다음과 같습니다.
 
-- Raspberry Pi
-- Linux Kernel Module
-- Out-of-Tree Driver
+| Function | Raspberry Pi BCM GPIO | Direction | Active level |
+|---|---:|---|---|
+| Button | GPIO27 | Input | Active-low |
+| LED | GPIO17 | Output | Active-high |
 
-GPIO 설정:
+### Button Circuit
 
-```c
-#define LED_GPIO_BCM     17
-#define BUTTON_GPIO_BCM  27
+버튼은 Raspberry Pi 내부 pull-up 저항을 사용합니다.
+
+```text
+GPIO27 ─── Button ─── GND
 ```
 
----
+동작 의미는 다음과 같습니다.
 
-## 프로젝트 구조
+```text
+Button released → GPIO27 is pulled HIGH internally
+Button pressed  → GPIO27 is connected to GND
+```
+
+Device Tree에서는 버튼을 active-low로 정의합니다.
+
+```dts
+button-gpios = <&gpio 27 1>;
+```
+
+따라서 드라이버에서 `gpiod_get_value_cansleep()`으로 읽은 logical value는 다음 의미를 가집니다.
+
+```text
+1 → Button pressed
+0 → Button released
+```
+
+### LED Circuit
+
+LED는 active-high 출력으로 구성합니다.
+
+```text
+GPIO17 ─── Resistor ─── LED ─── GND
+```
+
+동작 의미는 다음과 같습니다.
+
+```text
+GPIO17 HIGH → LED ON
+GPIO17 LOW  → LED OFF
+```
+
+일반적으로 LED 직렬 저항은 220Ω ~ 1kΩ 범위에서 사용합니다.
+
+## Project Files
 
 ```text
 .
 ├── gpio_event_driver.c
-├── Makefile
+├── gpio-event-overlay.dts
 ├── read_event.c
-├── test_debounce_ioctl.c
+├── Makefile
 └── README.md
 ```
 
----
+## Device Tree Overlay
 
-## 빌드
+`gpio-event-overlay.dts`는 Raspberry Pi GPIO 설정과 driver binding 정보를 정의합니다.
 
-커널 모듈 빌드:
+```dts
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		target = <&gpio>;
+		__overlay__ {
+			gpio_event_button_pins: gpio-event-button-pins {
+				brcm,pins = <27>;
+				brcm,function = <0>; /* input */
+				brcm,pull = <2>;     /* pull-up */
+			};
+
+			gpio_event_led_pins: gpio-event-led-pins {
+				brcm,pins = <17>;
+				brcm,function = <1>; /* output */
+				brcm,pull = <0>;     /* no pull */
+			};
+		};
+	};
+
+	fragment@1 {
+		target-path = "/";
+		__overlay__ {
+			gpio_event: gpio-event {
+				compatible = "miiniipark,gpio-event";
+
+				pinctrl-names = "default";
+				pinctrl-0 = <&gpio_event_button_pins
+					     &gpio_event_led_pins>;
+
+				button-gpios = <&gpio 27 1>;
+				led-gpios = <&gpio 17 0>;
+
+				status = "okay";
+			};
+		};
+	};
+};
+```
+
+GPIO flag 값은 다음 의미를 가집니다.
+
+```text
+0 → GPIO_ACTIVE_HIGH
+1 → GPIO_ACTIVE_LOW
+```
+
+`brcm,pull` 값은 다음 의미를 가집니다.
+
+```text
+0 → no pull
+1 → pull-down
+2 → pull-up
+```
+
+## Build
+
+커널 모듈, 유저 테스트 프로그램, Device Tree overlay를 모두 빌드합니다.
 
 ```bash
 make
 ```
 
-빌드 결과:
+빌드 결과물은 다음과 같습니다.
 
 ```text
 gpio_event_driver.ko
+read_event
+gpio-event.dtbo
 ```
 
-빌드 산출물 제거:
+커널 모듈만 빌드하려면:
+
+```bash
+make module
+```
+
+유저 공간 테스트 프로그램만 빌드하려면:
+
+```bash
+make user
+```
+
+Device Tree overlay만 빌드하려면:
+
+```bash
+make dtbo
+```
+
+빌드 결과물을 정리하려면:
 
 ```bash
 make clean
 ```
 
-사용자 공간 테스트 프로그램 빌드:
+## Install Device Tree Overlay
+
+빌드된 overlay를 Raspberry Pi overlay 디렉터리에 복사합니다.
 
 ```bash
-gcc -o read_event read_event.c
-gcc -o test_debounce_ioctl test_debounce_ioctl.c
+sudo cp gpio-event.dtbo /boot/firmware/overlays/
 ```
 
----
+`/boot/firmware/config.txt`에 다음 줄을 추가합니다.
 
-## 모듈 로드
+```text
+dtoverlay=gpio-event
+```
+
+예시:
+
+```bash
+sudo nano /boot/firmware/config.txt
+```
+
+수정 후 Raspberry Pi를 재부팅합니다.
+
+```bash
+sudo reboot
+```
+
+재부팅 후 overlay node가 적용되었는지 확인합니다.
+
+```bash
+ls /proc/device-tree/gpio-event
+```
+
+compatible 값을 확인하려면:
+
+```bash
+tr -d '\0' < /proc/device-tree/gpio-event/compatible
+```
+
+기대 출력:
+
+```text
+miiniipark,gpio-event
+```
+
+## Load Kernel Module
+
+Device Tree overlay 적용 후 커널 모듈을 로드합니다.
 
 ```bash
 sudo insmod gpio_event_driver.ko
 ```
 
-로그 확인:
+커널 로그를 확인합니다.
 
 ```bash
-dmesg | tail
+dmesg | tail -n 30
 ```
 
-모듈 제거:
+정상적으로 probe되면 `/dev/gpio_event`가 생성됩니다.
+
+```bash
+ls -l /dev/gpio_event
+```
+
+## Unload Kernel Module
 
 ```bash
 sudo rmmod gpio_event_driver
 ```
 
----
-
-## GPIO 이벤트 읽기
-
-테스트 프로그램 실행:
+커널 로그를 확인합니다.
 
 ```bash
-./read_event
+dmesg | tail -n 30
 ```
 
-버튼을 누르면 이벤트가 출력됩니다.
+## User Interface
 
-예시:
+### Character Device
+
+드라이버는 다음 character device를 생성합니다.
 
 ```text
-waiting for gpio event...
-event: seq=1 value=1
-event: seq=2 value=0
+/dev/gpio_event
 ```
 
-이벤트 구조체:
-
-```c
-struct gpio_event {
-    uint32_t seq;
-    int value;
-};
-```
-
-| 필드 | 설명 |
-|---|---|
-| seq | 이벤트 순번 |
-| value | GPIO 입력 값 |
-
----
-
-## LED 제어
-
-LED ON:
-
-```bash
-echo 1 > /dev/gpio_event
-```
-
-LED OFF:
-
-```bash
-echo 0 > /dev/gpio_event
-```
-
----
-
-## Poll 지원
-
-드라이버는 `poll()` 인터페이스를 지원합니다.
-
-사용자 프로그램은 GPIO 이벤트가 발생할 때까지 대기하다가, 이벤트 발생 시 `read()`로 이벤트를 읽습니다.
-
-동작 흐름:
+`read()`는 버튼 상태를 1바이트 문자로 반환합니다.
 
 ```text
-poll()
-  ↓
-버튼 입력 발생
-  ↓
-IRQ Handler
-  ↓
-Delayed Work
-  ↓
-FIFO 저장
-  ↓
-wake_up_interruptible()
-  ↓
-poll() 반환
-  ↓
-read()
+'1' → Button pressed
+'0' → Button released
 ```
 
----
+버튼 GPIO는 Device Tree에서 active-low로 정의되어 있으므로, 유저 공간에서는 물리 GPIO 레벨이 아니라 logical button state 기준으로 해석합니다.
 
-## Debounce 설정 (ioctl)
+### Sysfs
 
-현재 debounce 값을 조회하거나 변경할 수 있습니다.
-
-지원 ioctl:
-
-```c
-#define GPIO_EVENT_IOC_MAGIC 'g'
-#define GPIO_EVENT_IOC_SET_DEBOUNCE_MS _IOW(GPIO_EVENT_IOC_MAGIC, 1, unsigned int)
-#define GPIO_EVENT_IOC_GET_DEBOUNCE_MS _IOR(GPIO_EVENT_IOC_MAGIC, 2, unsigned int)
-```
-
-현재 값 조회:
-
-```bash
-./test_debounce_ioctl
-```
-
-값 변경:
-
-```bash
-./test_debounce_ioctl 50
-```
-
-예시:
-
-```text
-current debounce_ms = 20
-set debounce_ms = 50
-new debounce_ms = 50
-```
-
----
-
-## Debounce 설정 (sysfs)
-
-경로:
+debounce 시간은 sysfs attribute로 확인하거나 변경할 수 있습니다.
 
 ```text
 /sys/class/gpio_event/gpio_event/debounce_ms
 ```
 
-현재 값 확인:
+현재 debounce 값 확인:
 
 ```bash
 cat /sys/class/gpio_event/gpio_event/debounce_ms
 ```
 
-값 변경:
+debounce 값을 50ms로 변경:
 
 ```bash
 echo 50 | sudo tee /sys/class/gpio_event/gpio_event/debounce_ms
 ```
 
-ioctl과 sysfs는 동일한 `debounce_ms` 변수를 공유합니다.
-
----
-
-## Debounce 범위
-
-```c
-#define DEFAULT_DEBOUNCE_MS 20
-#define MIN_DEBOUNCE_MS     0
-#define MAX_DEBOUNCE_MS     1000
-```
-
-범위를 벗어난 값은 `EINVAL` 오류를 반환합니다.
-
----
-
-## 내부 동작 구조
+지원 범위:
 
 ```text
-GPIO Interrupt
-      ↓
- IRQ Handler
-      ↓
- Delayed Work
-      ↓
- Debounce 처리
-      ↓
- GPIO 값 읽기
-      ↓
- Event FIFO 저장
-      ↓
- Wait Queue Wakeup
-      ↓
- read() / poll()
+1ms ~ 1000ms
 ```
 
----
+기본값:
 
-## 사용된 커널 기능
+```text
+20ms
+```
 
-- Character Device
-- GPIO API
-- Interrupt Handler
-- Delayed Workqueue
-- Wait Queue
-- Poll
-- kfifo
-- Spinlock
-- ioctl
-- sysfs
-- Kernel Thread
-- copy_to_user()
-- copy_from_user()
+### ioctl
 
----
+드라이버는 debounce 설정을 위한 ioctl도 지원합니다.
 
-## 프로젝트 목표
+```c
+#define GPIO_EVENT_IOC_MAGIC            'g'
+#define GPIO_EVENT_IOC_SET_DEBOUNCE_MS  _IOW(GPIO_EVENT_IOC_MAGIC, 1, unsigned int)
+#define GPIO_EVENT_IOC_GET_DEBOUNCE_MS  _IOR(GPIO_EVENT_IOC_MAGIC, 2, unsigned int)
+```
 
-Linux 디바이스 드라이버의 핵심 메커니즘을 직접 구현하고 이해하는 것을 목표로 작성한 학습용 프로젝트입니다.
+현재 기본 테스트 경로는 sysfs `debounce_ms`입니다.
 
-구현 과정에서 Character Device, GPIO Interrupt, Wait Queue, Poll, ioctl, Kernel Thread, Sysfs 등의 기능을 단계적으로 추가하며 Linux 커널 드라이버 구조를 학습하였습니다.
+## Test Program
 
----
+`read_event`는 `/dev/gpio_event`를 열고 `poll()`로 이벤트를 기다린 뒤, `read()`로 버튼 상태를 읽어 출력합니다.
 
-## 라이선스
+기본 실행:
 
-GPL
+```bash
+./read_event
+```
+
+출력 예시:
+
+```text
+Reading button events from /dev/gpio_event
+Press Ctrl+C to stop.
+
+[2026-07-02 21:15:03.125] event=1 button_value=1 state=PRESSED
+[2026-07-02 21:15:03.842] event=2 button_value=0 state=RELEASED
+```
+
+10개 이벤트만 읽기:
+
+```bash
+./read_event -n 10
+```
+
+5초 timeout 설정:
+
+```bash
+./read_event -t 5000
+```
+
+device path 직접 지정:
+
+```bash
+./read_event -d /dev/gpio_event
+```
+
+도움말 출력:
+
+```bash
+./read_event -h
+```
+
+## Driver Flow
+
+버튼 이벤트 처리 흐름은 다음과 같습니다.
+
+```text
+Button GPIO interrupt
+        ↓
+IRQ handler
+        ↓
+mod_delayed_work()
+        ↓
+debounce work
+        ↓
+gpiod_get_value_cansleep(button_gpiod)
+        ↓
+gpiod_set_value_cansleep(led_gpiod, value)
+        ↓
+push '1' or '0' into FIFO
+        ↓
+wake_up_interruptible()
+        ↓
+userspace poll()/read()
+```
+
+## Resource Management
+
+드라이버는 `platform_driver` 구조를 사용합니다.
+
+초기화 흐름:
+
+```text
+module_init
+        ↓
+alloc_chrdev_region()
+        ↓
+class_create()
+        ↓
+platform_driver_register()
+        ↓
+Device Tree compatible match
+        ↓
+probe()
+```
+
+해제 흐름:
+
+```text
+module_exit
+        ↓
+platform_driver_unregister()
+        ↓
+remove()
+        ↓
+class_destroy()
+        ↓
+unregister_chrdev_region()
+```
+
+`probe()` 내부에서는 devres 기반 API를 사용해 자원을 관리합니다.
+
+```text
+devm_kzalloc()
+devm_gpiod_get()
+devm_request_irq()
+devm_add_action_or_reset()
+```
+
+`cdev`, device node, sysfs file은 명시적으로 정리합니다.
+
+```text
+device_remove_file()
+device_destroy()
+cdev_del()
+```
+
+IRQ와 delayed work는 cleanup action으로 묶어 정리합니다. IRQ를 먼저 해제한 뒤 delayed work를 취소하여, 해제 중 새로운 work가 다시 예약되는 상황을 방지합니다.
+
+## Development History
+
+이 프로젝트는 다음 순서로 구현되었습니다.
+
+```text
+1. Character device 기본 구조 구현
+2. GPIO button/LED 제어 추가
+3. GPIO interrupt 기반 버튼 이벤트 처리 추가
+4. delayed_work 기반 debounce 처리 추가
+5. FIFO와 wait queue 기반 blocking read 구현
+6. poll/select/epoll 지원 추가
+7. debounce_ms ioctl SET/GET 추가
+8. debounce_ms sysfs attribute 추가
+9. platform_driver 구조로 전환
+10. devm API 기반 자원 관리 적용
+11. cleanup action으로 IRQ/work 해제 경로 개선
+12. Device Tree overlay 추가
+13. legacy GPIO number API에서 gpiod descriptor API로 전환
+14. 내부 pull-up + active-low 버튼 회로 적용
+15. read_event 테스트 프로그램으로 실제 보드 동작 검증
+```
+
+## Current Status
+
+현재 구현은 Raspberry Pi에서 다음 구성을 기준으로 동작 확인되었습니다.
+
+```text
+Button: GPIO27, internal pull-up, active-low
+LED:    GPIO17, active-high
+```
+
+검증 항목:
+
+```text
+- Device Tree overlay 적용
+- platform_driver probe 동작
+- /dev/gpio_event 생성
+- button press/release 이벤트 read
+- poll 기반 이벤트 대기
+- LED 상태 동기화
+- sysfs debounce_ms 조회 및 변경
+- module unload cleanup
+```
