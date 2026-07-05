@@ -395,12 +395,12 @@ err_cdev_del:
 	return ret;
 }
 
-static void gpio_event_remove(struct platform_device *pdev)
+static int gpio_event_remove(struct platform_device *pdev)
 {
 	struct gpio_event *ge = platform_get_drvdata(pdev);
 
 	if (!ge)
-		return;
+		return 0;
 
 	devm_release_action(&pdev->dev, gpio_event_irq_work_cleanup, ge);
 
@@ -409,6 +409,8 @@ static void gpio_event_remove(struct platform_device *pdev)
 	cdev_del(&ge->cdev);
 
 	dev_info(&pdev->dev, "removed\n");
+
+	return 0;
 }
 
 static const struct of_device_id gpio_event_of_match[] = {
