@@ -1,4 +1,4 @@
-obj-m := gpio_event_driver.o
+obj-m := gpio-event-bbb-driver.o
 
 SRC := $(shell pwd)
 
