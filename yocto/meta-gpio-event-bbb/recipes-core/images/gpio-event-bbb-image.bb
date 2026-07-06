@@ -1,11 +1,14 @@
 SUMMARY = "GPIO event demo image for BeagleBone Black"
-DESCRIPTION = "Minimal image for the GPIO event platform driver project on BeagleBone Black."
+DESCRIPTION = "Minimal BeagleBone Black image for the GPIO event platform driver project."
 LICENSE = "CLOSED"
+
+COMPATIBLE_MACHINE = "^beaglebone-yocto$"
 
 inherit core-image
 
 IMAGE_INSTALL:append = " \
     kernel-module-gpio-event-bbb-driver \
+    read-event \
 "
 
 do_image_wic[depends] += "gpio-event-bbb-extlinux:do_deploy"
