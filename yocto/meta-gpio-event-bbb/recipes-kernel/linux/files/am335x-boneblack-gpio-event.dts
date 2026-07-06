@@ -29,8 +29,6 @@
 		button-gpios = <&gpio1 16 GPIO_ACTIVE_LOW>;
 		led-gpios = <&gpio1 28 GPIO_ACTIVE_HIGH>;
 
-		debounce-ms = <20>;
-
 		status = "okay";
 	};
 };
