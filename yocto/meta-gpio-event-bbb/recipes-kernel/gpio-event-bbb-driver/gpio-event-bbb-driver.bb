@@ -12,3 +12,5 @@ SRC_URI = " \
 "
 
 S = "${WORKDIR}"
+
+RPROVIDES:${PN} += "kernel-module-gpio-event-bbb-driver"
