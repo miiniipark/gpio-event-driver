@@ -1,20 +1,20 @@
 /dts-v1/;
-/plugin/;
 
+#include "am335x-boneblack.dts"
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/pinctrl/am33xx.h>
 
 / {
-	compatible = "ti,am335x-bone-black", "ti,am335x-bone", "ti,am33xx";
+	model = "TI AM335x BeagleBone Black with GPIO Event";
 };
 
 &am33xx_pinmux {
 	gpio_event_pins: gpio-event-pins {
 		pinctrl-single,pins = <
-			/* P9_15: gpio1_16, GPIO48, button input */
+			/* P9_15: GPIO1_16 = GPIO48, button input */
 			AM33XX_PADCONF(AM335X_PIN_GPMC_A0, PIN_INPUT_PULLUP, MUX_MODE7)
 
-			/* P9_12: gpio1_28, GPIO60, LED output */
+			/* P9_12: GPIO1_28 = GPIO60, LED output */
 			AM33XX_PADCONF(AM335X_PIN_GPMC_BEN1, PIN_OUTPUT, MUX_MODE7)
 		>;
 	};
@@ -23,8 +23,6 @@
 &ocp {
 	gpio_event: gpio-event {
 		compatible = "miiniipark,gpio-event";
-		status = "okay";
-
 		pinctrl-names = "default";
 		pinctrl-0 = <&gpio_event_pins>;
 
@@ -32,5 +30,7 @@
 		led-gpios = <&gpio1 28 GPIO_ACTIVE_HIGH>;
 
 		debounce-ms = <20>;
+
+		status = "okay";
 	};
 };

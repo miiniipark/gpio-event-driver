@@ -8,10 +8,9 @@ IMAGE_INSTALL:append = " \
     kernel-module-gpio-event-bbb-driver \
 "
 
-EXTRA_IMAGEDEPENDS:append:beaglebone-yocto = " \
-    gpio-event-bbb-overlay \
-"
+do_image_wic[depends] += "gpio-event-bbb-extlinux:do_deploy"
 
-IMAGE_BOOT_FILES:append:beaglebone-yocto = " \
-    devicetree/gpio-event-bbb-overlay.dtbo;overlays/gpio-event-bbb-overlay.dtbo \
+IMAGE_BOOT_FILES:append = " \
+    am335x-boneblack-gpio-event.dtb \
+    extlinux.conf;extlinux/extlinux.conf \
 "
